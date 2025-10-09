@@ -19,9 +19,11 @@
 #include "imu_sensor_broadcaster/imu_sensor_broadcaster.hpp"
 
 #include <memory>
+#include <semantic_components/magnetic_field_sensor.hpp>
 #include <string>
 
 #include "imu_sensor_broadcaster/imu_transform.hpp"
+#include "sensor_msgs/msg/magnetic_field.hpp"
 
 namespace imu_sensor_broadcaster
 {
@@ -62,7 +64,6 @@ controller_interface::CallbackReturn IMUSensorBroadcaster::on_configure(
   imu_sensor_ = std::make_unique<semantic_components::IMUSensor>(params_.sensor_name);
   try
   {
-    // register ft sensor data publisher
     sensor_state_publisher_ =
       get_node()->create_publisher<sensor_msgs::msg::Imu>("~/imu", rclcpp::SystemDefaultsQoS());
     realtime_publisher_ = std::make_unique<StatePublisher>(sensor_state_publisher_);
@@ -70,19 +71,73 @@ controller_interface::CallbackReturn IMUSensorBroadcaster::on_configure(
   catch (const std::exception & e)
   {
     fprintf(
-      stderr, "Exception thrown during publisher creation at configure stage with message : %s \n",
+      stderr,
+      "Exception thrown during publisher creation at configure stage "
+      "with message : %s \n",
       e.what());
     return CallbackReturn::ERROR;
   }
+  if (params_.do_filtering && params_.publish_raw)
+  {
+    try
+    {
+      imu_state_publisher_ = get_node()->create_publisher<sensor_msgs::msg::Imu>(
+        "~/imu/raw", rclcpp::SystemDefaultsQoS());
+      imu_realtime_publisher_ = std::make_unique<StatePublisher>(imu_state_publisher_);
+    }
+    catch (const std::exception & e)
+    {
+      fprintf(
+        stderr,
+        "Exception thrown during publisher creation at configure stage "
+        "with message : %s \n",
+        e.what());
+      return CallbackReturn::ERROR;
+    }
+  }
+  if (params_.has_magnetometer)
+  {
+    magnetic_field_sensor_ =
+      std::make_unique<semantic_components::MagneticFieldSensor>(params_.sensor_name);
+    if (!params_.do_filtering || (params_.do_filtering && params_.publish_raw))
+    {
+      try
+      {
+        magnetic_field_state_publisher_ =
+          get_node()->create_publisher<sensor_msgs::msg::MagneticField>(
+            "~/mag/raw", rclcpp::SystemDefaultsQoS());
+        realtime_publisher_ = std::make_unique<StatePublisher>(sensor_state_publisher_);
+      }
+      catch (const std::exception & e)
+      {
+        fprintf(
+          stderr,
+          "Exception thrown during publisher creation at configure stage "
+          "with message : %s \n",
+          e.what());
+        return CallbackReturn::ERROR;
+      }
+    }
+  }
 
-  state_message_.header.frame_id = params_.frame_id;
+  imu_state_message_.header.frame_id = params_.frame_id;
   // convert double vector to fixed-size array in the message
   for (size_t i = 0; i < 9; ++i)
   {
-    state_message_.orientation_covariance[i] = params_.static_covariance_orientation[i];
-    state_message_.angular_velocity_covariance[i] = params_.static_covariance_angular_velocity[i];
-    state_message_.linear_acceleration_covariance[i] =
+    imu_state_message_.orientation_covariance[i] = params_.static_covariance_orientation[i];
+    imu_state_message_.angular_velocity_covariance[i] =
+      params_.static_covariance_angular_velocity[i];
+    imu_state_message_.linear_acceleration_covariance[i] =
       params_.static_covariance_linear_acceleration[i];
+  }
+  if (params_.has_magnetometer)
+  {
+    magnetic_field_state_message_.header.frame_id = params_.frame_id;
+    for (size_t i = 0; i < 9; ++i)
+    {
+      magnetic_field_state_message_.magnetic_field_covariance[i] =
+        params_.static_covariance_magnetic_field[i];
+    }
   }
 
   RCLCPP_DEBUG(get_node()->get_logger(), "configure successful");
@@ -103,6 +158,13 @@ controller_interface::InterfaceConfiguration IMUSensorBroadcaster::state_interfa
   controller_interface::InterfaceConfiguration state_interfaces_config;
   state_interfaces_config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   state_interfaces_config.names = imu_sensor_->get_state_interface_names();
+  if (params_.has_magnetometer)
+  {
+    const auto magnetic_field_interface_names = magnetic_field_sensor_->get_state_interface_names();
+    state_interfaces_config.names.insert(
+      state_interfaces_config.names.end(), magnetic_field_interface_names.cbegin(),
+      magnetic_field_interface_names.cend());
+  }
   return state_interfaces_config;
 }
 
@@ -110,6 +172,10 @@ controller_interface::CallbackReturn IMUSensorBroadcaster::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
   imu_sensor_->assign_loaned_state_interfaces(state_interfaces_);
+  if (params_.has_magnetometer)
+  {
+    magnetic_field_sensor_->assign_loaned_state_interfaces(state_interfaces_);
+  }
   return CallbackReturn::SUCCESS;
 }
 
@@ -117,20 +183,49 @@ controller_interface::CallbackReturn IMUSensorBroadcaster::on_deactivate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
   imu_sensor_->release_interfaces();
+  if (params_.has_magnetometer)
+  {
+    magnetic_field_sensor_->release_interfaces();
+  }
   return CallbackReturn::SUCCESS;
 }
 
 controller_interface::return_type IMUSensorBroadcaster::update_and_write_commands(
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/)
 {
-  sensor_msgs::msg::Imu input_imu{state_message_};
+  sensor_msgs::msg::Imu input_imu{imu_state_message_};
   imu_sensor_->get_values_as_message(input_imu);
-  do_transform(state_message_, input_imu, r_);
+  do_transform(imu_state_message_, input_imu, r_);
+  if (params_.has_magnetometer)
+  {
+    magnetic_field_sensor_->get_values_as_message(magnetic_field_state_message_);
+  }
+
+  if (params_.do_filtering)
+  {
+    state_message_ = imu_state_message_;  // TODO(amronos): replace with actual filtering code
+  }
+  else
+  {
+    state_message_ = imu_state_message_;
+  }
 
   if (realtime_publisher_)
   {
     state_message_.header.stamp = time;
     realtime_publisher_->try_publish(state_message_);
+  }
+  if (
+    magnetic_field_realtime_publisher_ && params_.has_magnetometer &&
+    (!params_.do_filtering || (params_.do_filtering && params_.publish_raw)))
+  {
+    magnetic_field_state_message_.header.stamp = time;
+    magnetic_field_realtime_publisher_->try_publish(magnetic_field_state_message_);
+  }
+  if (imu_realtime_publisher_ && params_.do_filtering && params_.publish_raw)
+  {
+    imu_state_message_.header.stamp = time;
+    imu_realtime_publisher_->try_publish(imu_state_message_);
   }
 
   return controller_interface::return_type::OK;
@@ -155,34 +250,46 @@ std::vector<hardware_interface::StateInterface> IMUSensorBroadcaster::on_export_
 
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "orientation.x", &state_message_.orientation.x));
+      export_prefix, "orientation.x", &imu_state_message_.orientation.x));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "orientation.y", &state_message_.orientation.y));
+      export_prefix, "orientation.y", &imu_state_message_.orientation.y));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "orientation.z", &state_message_.orientation.z));
+      export_prefix, "orientation.z", &imu_state_message_.orientation.z));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "orientation.w", &state_message_.orientation.w));
+      export_prefix, "orientation.w", &imu_state_message_.orientation.w));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "angular_velocity.x", &state_message_.angular_velocity.x));
+      export_prefix, "angular_velocity.x", &imu_state_message_.angular_velocity.x));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "angular_velocity.y", &state_message_.angular_velocity.y));
+      export_prefix, "angular_velocity.y", &imu_state_message_.angular_velocity.y));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "angular_velocity.z", &state_message_.angular_velocity.z));
+      export_prefix, "angular_velocity.z", &imu_state_message_.angular_velocity.z));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "linear_acceleration.x", &state_message_.linear_acceleration.x));
+      export_prefix, "linear_acceleration.x", &imu_state_message_.linear_acceleration.x));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "linear_acceleration.y", &state_message_.linear_acceleration.y));
+      export_prefix, "linear_acceleration.y", &imu_state_message_.linear_acceleration.y));
   exported_state_interfaces.emplace_back(
     hardware_interface::StateInterface(
-      export_prefix, "linear_acceleration.z", &state_message_.linear_acceleration.z));
+      export_prefix, "linear_acceleration.z", &imu_state_message_.linear_acceleration.z));
+  if (params_.has_magnetometer)
+  {
+    exported_state_interfaces.emplace_back(
+      hardware_interface::StateInterface(
+        export_prefix, "magnetic_field.x", &magnetic_field_state_message_.magnetic_field.x));
+    exported_state_interfaces.emplace_back(
+      hardware_interface::StateInterface(
+        export_prefix, "magnetic_field.y", &magnetic_field_state_message_.magnetic_field.y));
+    exported_state_interfaces.emplace_back(
+      hardware_interface::StateInterface(
+        export_prefix, "magnetic_field.z", &magnetic_field_state_message_.magnetic_field.z));
+  }
 
   return exported_state_interfaces;
 }

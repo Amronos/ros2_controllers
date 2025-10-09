@@ -5,7 +5,7 @@ imu_sensor_broadcaster:
     read_only: true,
     description: "Defines sensor name used as prefix for its interfaces.
     Interface names are: ``<sensor_name>/orientation.x, ..., <sensor_name>/angular_velocity.x, ...,
-    <sensor_name>/linear_acceleration.x.``",
+    <sensor_name>/linear_acceleration.x, ..., <sensor_name>/magnetic_field.x, ....``",
     validation: {
       not_empty<>: null
     }
@@ -18,6 +18,24 @@ imu_sensor_broadcaster:
     validation: {
       not_empty<>: null
     }
+  }
+  has_magnetometer: {
+    type: bool,
+    default_value: false,
+    read_only: true,
+    description: "Specifies whether the IMU has an included magnetometer. The interface for magnetic_field is exposed when the value is true."
+  }
+  do_filtering: {
+    type: bool,
+    default_value: true,
+    read_only: true,
+    description: "Whether to apply filtering to the raw IMU data to produce an orientation quaternion."
+  }
+  publish_raw: {
+    type: bool,
+    default_value: false,
+    read_only: true,
+    description: "Whether to publish the raw IMU data. Used only when do_filtering is true."
   }
   static_covariance_orientation: {
     type: double_array,
@@ -42,6 +60,15 @@ imu_sensor_broadcaster:
     default_value: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     read_only: true,
     description: "Static linear acceleration covariance. Row major about x, y, z axes",
+    validation: {
+      fixed_size<>: [9],
+    }
+  }
+  static_covariance_magnetic_field: {
+    type: double_array,
+    default_value: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    read_only: true,
+    description: "Static magnetic field covariance. Row major about x, y, z axes",
     validation: {
       fixed_size<>: [9],
     }
